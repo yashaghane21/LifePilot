@@ -17,6 +17,7 @@ class AppError(Exception):
 
     status_code: int = 400
     code: str = "bad_request"
+    headers: dict[str, str] | None = None
 
     def __init__(self, message: str) -> None:
         super().__init__(message)
@@ -45,7 +46,7 @@ def _status_code_slug(status_code: int) -> str:
 
 
 async def _app_error_handler(request: Request, exc: AppError) -> JSONResponse:
-    return error_response(exc.status_code, exc.code, exc.message)
+    return error_response(exc.status_code, exc.code, exc.message, headers=exc.headers)
 
 
 async def _http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:

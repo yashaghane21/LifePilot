@@ -8,7 +8,8 @@ from datetime import UTC, datetime
 request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
 
 # Attributes every LogRecord has; anything else was passed via `extra=` and is logged as a field.
-_STANDARD_ATTRS = set(vars(logging.makeLogRecord({}))) | {"message", "asctime"}
+# `color_message` is uvicorn's ANSI-coloured duplicate of the message.
+_STANDARD_ATTRS = set(vars(logging.makeLogRecord({}))) | {"message", "asctime", "color_message"}
 
 
 class JsonFormatter(logging.Formatter):

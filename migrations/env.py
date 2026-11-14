@@ -7,15 +7,15 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from alembic import context
 from app.core.config import get_settings
+from app.db import models  # noqa: F401  (registers every table on Base.metadata)
 from app.db.base import Base
-
-# Import model modules here as they are added, so autogenerate can see their tables.
-# e.g. from app.modules.users import models as users_models  # noqa: F401
 
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # Without disable_existing_loggers=False, running migrations in-process (e.g. from
+    # tests) would silently disable every logger the app had already created.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

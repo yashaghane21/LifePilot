@@ -1,14 +1,17 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import APIRouter, FastAPI
 
 from app.core.config import get_settings
 from app.core.errors import register_exception_handlers
 from app.core.logging import configure_logging
 from app.core.middleware import request_context_middleware
 from app.db.session import engine
+from app.modules.auth.google_router import router as google_auth_router
+from app.modules.auth.router import router as auth_router
 from app.modules.health.router import router as health_router
+from app.modules.users.router import router as users_router
 
 
 @asynccontextmanager
@@ -24,7 +27,14 @@ def create_app() -> FastAPI:
     app = FastAPI(title="LifePilot AI", version="0.1.0", lifespan=lifespan)
     app.middleware("http")(request_context_middleware)
     register_exception_handlers(app)
+
+    # Health checks stay unversioned at the root; everything else lives under /api/v1.
     app.include_router(health_router)
+    api = APIRouter(prefix="/api/v1")
+    api.include_router(auth_router)
+    api.include_router(google_auth_router)
+    api.include_router(users_router)
+    app.include_router(api)
     return app
 
 
