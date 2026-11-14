@@ -1,7 +1,8 @@
 """Chat and conversations: the full turn, user isolation, failure handling, context and privacy."""
 
+import json
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Sequence
 from datetime import date
 from decimal import Decimal
 
@@ -12,6 +13,7 @@ from sqlalchemy import func, select
 
 from app.ai.chat.context import PastMessage, build_messages
 from app.ai.chat.router import get_chat_provider
+from app.ai.chat.service import drain_background_saves, prepare_turn, stream_chat_turn
 from app.ai.prompts.system import PROMPT_VERSION
 from app.ai.providers.base import (
     ChatMessage,
@@ -21,6 +23,9 @@ from app.ai.providers.base import (
     LLMRateLimitError,
     LLMUnavailableError,
     ResponseSchema,
+    StreamDone,
+    StreamEvent,
+    TextDelta,
     ToolSpec,
     Usage,
 )
@@ -28,6 +33,7 @@ from app.ai.providers.fake import FakeProvider
 from app.db.session import SessionLocal, engine
 from app.modules.conversations.models import Conversation, Message
 from app.modules.conversations.service import title_from_message
+from app.modules.users.models import User
 from tests.test_auth import bearer, register, token_for
 
 pytestmark = pytest.mark.usefixtures("clean_db")
@@ -352,3 +358,159 @@ class PoolSpyProvider(FakeProvider):
     ) -> ChatResult:
         self.checked_out.append(engine.pool.checkedout())  # type: ignore[attr-defined]
         return ChatResult("ok", (), "stop", Usage(1, 1, None), "fake-model", 1.0)
+
+
+# ------------------------------------------------------------------ streaming
+
+
+def parse_sse(text: str) -> list[tuple[str, dict]]:
+    events = []
+    for block in text.strip().split("\n\n"):
+        fields = dict(line.split(": ", 1) for line in block.splitlines())
+        events.append((fields["event"], json.loads(fields["data"])))
+    return events
+
+
+async def stream(
+    client: httpx.AsyncClient, token: str, message: str, conversation_id: str | None = None
+) -> httpx.Response:
+    body: dict[str, str] = {"message": message}
+    if conversation_id:
+        body["conversation_id"] = conversation_id
+    return await client.post("/api/v1/chat/stream", json=body, headers=bearer(token))
+
+
+class MidStreamFailure(FakeProvider):
+    async def stream(self, messages: Sequence[ChatMessage], **kwargs: object) -> AsyncIterator[StreamEvent]:  # type: ignore[override]
+        yield TextDelta("Half an ")
+        raise LLMUnavailableError("connection dropped")
+
+
+class PoolSpyStreamProvider(FakeProvider):
+    def __init__(self) -> None:
+        super().__init__()
+        self.checked_out: list[int] = []
+
+    async def stream(self, messages: Sequence[ChatMessage], **kwargs: object) -> AsyncIterator[StreamEvent]:  # type: ignore[override]
+        self.checked_out.append(engine.pool.checkedout())  # type: ignore[attr-defined]
+        yield TextDelta("ok")
+        yield StreamDone(ChatResult("ok", (), "stop", Usage(1, 1, None), "fake-model", 1.0))
+
+
+class TestStreaming:
+    async def test_new_conversation_streams_then_stores(self, client: httpx.AsyncClient, fake: FakeProvider) -> None:
+        token = await token_for(client, "a@example.com")
+        fake.reply("Here is your weekly plan")
+
+        response = await stream(client, token, "Plan my week")
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert response.headers["cache-control"] == "no-cache"
+        events = parse_sse(response.text)
+        names = [name for name, _ in events]
+        assert names[0] == "start" and names[-1] == "done"
+        assert set(names[1:-1]) == {"delta"}
+        assert "".join(data["text"] for name, data in events if name == "delta") == "Here is your weekly plan"
+        start, done = events[0][1], events[-1][1]
+        assert start == {"conversation_id": done["conversation"]["id"], "title": "Plan my week"}
+        assert done["assistant_message"]["content"] == "Here is your weekly plan"
+        assert await count(Message) == 2
+
+    async def test_follow_up_streams_with_history(self, client: httpx.AsyncClient, fake: FakeProvider) -> None:
+        token = await token_for(client, "a@example.com")
+        conversation_id = parse_sse((await stream(client, token, "first")).text)[0][1]["conversation_id"]
+
+        response = await stream(client, token, "second", conversation_id)
+
+        assert parse_sse(response.text)[-1][0] == "done"
+        assert [m.content for m in fake.calls[1].messages[1:]] == ["first", "(fake reply) first", "second"]
+
+    async def test_anothers_conversation_is_a_plain_404_before_streaming(
+        self, client: httpx.AsyncClient, fake: FakeProvider
+    ) -> None:
+        alice = await token_for(client, "alice@example.com")
+        bob = await token_for(client, "bob@example.com")
+        conversation_id = parse_sse((await stream(client, alice, "private")).text)[0][1]["conversation_id"]
+        calls_before = len(fake.calls)
+
+        response = await stream(client, bob, "hijack", conversation_id)
+
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "conversation_not_found"
+        assert len(fake.calls) == calls_before
+
+    async def test_error_before_any_text_is_an_error_event(self, client: httpx.AsyncClient, app: FastAPI) -> None:
+        token = await token_for(client, "a@example.com")
+        app.dependency_overrides[get_chat_provider] = lambda: FailingProvider(LLMRateLimitError("slow down"))
+
+        events = parse_sse((await stream(client, token, "hello")).text)
+
+        assert [name for name, _ in events] == ["start", "error"]
+        assert events[1][1]["code"] == "assistant_unavailable"
+        assert "slow down" not in json.dumps(events)
+        assert (await count(Conversation), await count(Message)) == (0, 0)
+
+    async def test_failure_mid_reply_stores_nothing(self, client: httpx.AsyncClient, app: FastAPI) -> None:
+        token = await token_for(client, "a@example.com")
+        app.dependency_overrides[get_chat_provider] = MidStreamFailure
+
+        events = parse_sse((await stream(client, token, "hello")).text)
+
+        assert [name for name, _ in events] == ["start", "delta", "error"]
+        assert (await count(Conversation), await count(Message)) == (0, 0)
+
+    async def test_empty_reply_is_an_error_event(self, client: httpx.AsyncClient, fake: FakeProvider) -> None:
+        token = await token_for(client, "a@example.com")
+        fake.reply("   ")
+
+        events = parse_sse((await stream(client, token, "hello")).text)
+
+        assert events[-1][0] == "error" and events[-1][1]["code"] == "assistant_failed"
+        assert await count(Message) == 0
+
+    async def test_no_db_connection_is_held_while_streaming(self, client: httpx.AsyncClient, app: FastAPI) -> None:
+        token = await token_for(client, "a@example.com")
+        spy = PoolSpyStreamProvider()
+        app.dependency_overrides[get_chat_provider] = lambda: spy
+        conversation_id = parse_sse((await stream(client, token, "first")).text)[0][1]["conversation_id"]
+
+        await stream(client, token, "second", conversation_id)
+
+        assert spy.checked_out == [0, 0]
+
+
+class TestStop:
+    """Closing the stream mid-reply (Stop button, closed tab) keeps the text already shown."""
+
+    async def start_stream(self, client: httpx.AsyncClient, fake: FakeProvider) -> AsyncIterator[str]:
+        await register(client, email="a@example.com")
+        async with SessionLocal() as db:
+            user_id = (await db.scalars(select(User.id).where(User.email == "a@example.com"))).one()
+            turn = await prepare_turn(db, user_id=user_id, conversation_id=None, text="Tell me a story", today=TODAY)
+        fake.reply("Once upon a time there was a cat")
+        return stream_chat_turn(fake, turn)
+
+    async def test_stopped_reply_is_saved_as_cancelled(self, client: httpx.AsyncClient, fake: FakeProvider) -> None:
+        events = await self.start_stream(client, fake)
+        received = [await anext(events) for _ in range(3)]  # start + two words
+
+        await events.aclose()  # what the server does when the client disconnects
+        await drain_background_saves()
+
+        assert received[0].startswith("event: start")
+        async with SessionLocal() as db:
+            messages = list(await db.scalars(select(Message).order_by(Message.created_at, Message.id)))
+        assert [(m.role, m.content) for m in messages] == [("user", "Tell me a story"), ("assistant", "Once upon")]
+        stopped = messages[1]
+        assert stopped.finish_reason == "cancelled"
+        assert stopped.input_tokens is None and stopped.cost_usd is None  # usage only arrives at the end
+
+    async def test_stop_before_any_text_saves_nothing(self, client: httpx.AsyncClient, fake: FakeProvider) -> None:
+        events = await self.start_stream(client, fake)
+        await anext(events)  # only the start event
+
+        await events.aclose()
+        await drain_background_saves()
+
+        assert (await count(Conversation), await count(Message)) == (0, 0)

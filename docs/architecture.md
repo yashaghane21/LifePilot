@@ -220,6 +220,37 @@ sequenceDiagram
   first 60 characters of the opening message (no extra LLM call).
 - Until tools exist (3.5), the prompt forbids claiming that anything was saved or looked up.
 
+### Streaming (Phase 3.3)
+
+`POST /api/v1/chat/stream` takes the same body as `/chat` and answers with Server-Sent Events:
+
+```
+event: start   data: {"conversation_id": "…", "title": "…"}
+event: delta   data: {"text": "Hel"}            (repeated)
+event: done    data: {conversation, user_message, assistant_message}   (same as POST /chat)
+event: error   data: {"code": "assistant_unavailable", "message": "…", "request_id": "…"}
+```
+
+- **Errors before the stream** (validation, auth, someone else's conversation) are normal HTTP
+  errors: `prepare_turn` runs before the 200 is sent, and commits so no DB connection is held
+  while streaming. Errors **during** the stream arrive as an `error` event.
+- **Provider** (`OpenRouterProvider.stream`): parses `data:` lines, ignores `:` keep-alive
+  comments and hidden `reasoning` deltas, detects error chunks mid-stream, records
+  **time to first token** (`ttft_ms` in the `llm_call` log). Retries only before the first
+  token: after text has been shown, a retry would glue a different reply onto it.
+- **Storage stays all-or-nothing, with one exception**: when the client disconnects mid-reply
+  (Stop button, closed tab), the text already sent is stored with `finish_reason="cancelled"` and
+  unknown usage (providers report tokens only at the end). The save runs as a tracked background
+  task because the request is being torn down; shutdown waits for these tasks
+  (`drain_background_saves`). A provider error mid-reply stores nothing.
+- The completed reply is saved under `asyncio.shield`, so a disconnect after the last token still
+  stores it.
+- **Web**: `api/sse.ts` reads the stream with `fetch` (the browser's `EventSource` can't POST or
+  send an Authorization header). The send button becomes **Stop** (`AbortController`); leaving
+  the chat also stops the reply. Auto-scroll follows new text only while you are at the bottom.
+- The request log line (`request_completed`) is written when the response *starts*; stream
+  duration is in the `llm_call` line.
+
 ## 7. Planned AI request flow (Phase 3–4)
 
 Example: *"I spent ₹250 on food"*.
@@ -372,7 +403,7 @@ suppressed.
 | 2b | Web sessions: refresh tokens in httpOnly cookies, rotation and revocation; web Login/Register screens | Done |
 | 2c | Sign in with Google (OpenID Connect on PyJWT): state + PKCE + nonce, ID-token verification, `oauth_identities` table, nullable `password_hash`, pre-account-hijacking defence | Done |
 | 3c | Google Workspace connector (Calendar, Gmail, Drive): incremental consent per scope, `access_type=offline`, refresh tokens encrypted at rest in `connected_accounts`, revoke on disconnect; Gmail scopes need Google verification before other users | — |
-| 3 | AI assistant: provider abstraction (3.1 done), chat + conversations (3.2 done), streaming (3.3), structured outputs (3.4), tool calling with verification and approval (3.5) | In progress |
+| 3 | AI assistant: provider abstraction (3.1 done), chat + conversations (3.2 done), streaming (3.3 done), structured outputs (3.4), tool calling with verification and approval (3.5) | In progress |
 | 4 | Personal memory: extraction, storage, retrieval, semantic memory | — |
 | 5 | Finance | — |
 | 5b | Bank statement import: PDF upload → deterministic table parsing (LLM structured-output fallback) → balance reconciliation check → categorisation → user review → single-transaction import; idempotent per file hash and transaction fingerprint; account numbers and balances redacted before any LLM call | — |

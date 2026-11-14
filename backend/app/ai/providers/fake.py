@@ -1,9 +1,20 @@
 """A scripted provider for tests and offline development: no network, no cost, fully predictable."""
 
-from collections.abc import Sequence
+import re
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 
-from app.ai.providers.base import ChatMessage, ChatResult, ResponseSchema, ToolCall, ToolSpec, Usage
+from app.ai.providers.base import (
+    ChatMessage,
+    ChatResult,
+    ResponseSchema,
+    StreamDone,
+    StreamEvent,
+    TextDelta,
+    ToolCall,
+    ToolSpec,
+    Usage,
+)
 
 
 @dataclass
@@ -56,6 +67,19 @@ class FakeProvider:
             model=model or self.default_model,
             latency_ms=1.0,
         )
+
+    async def stream(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        model: str | None = None,
+        max_output_tokens: int = 4096,
+    ) -> AsyncIterator[StreamEvent]:
+        """The same reply complete() would give, delivered word by word."""
+        result = await self.complete(messages, model=model, max_output_tokens=max_output_tokens)
+        for word in re.findall(r"\S+\s*", result.content or ""):
+            yield TextDelta(word)
+        yield StreamDone(result)
 
     async def aclose(self) -> None:
         return None

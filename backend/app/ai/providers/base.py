@@ -1,6 +1,6 @@
 """The provider-neutral LLM interface. Everything outside `app.ai.providers` uses only these types."""
 
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -64,6 +64,25 @@ class ChatResult:
     latency_ms: float
     provider_request_id: str | None = None
     attempts: int = field(default=1)
+    # Streaming only: how long until the first visible text arrived (what users perceive as speed).
+    time_to_first_token_ms: float | None = None
+
+
+@dataclass(frozen=True)
+class TextDelta:
+    """A piece of reply text, emitted as soon as the provider sends it."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class StreamDone:
+    """The final event of a stream: the complete reply with usage and finish reason."""
+
+    result: ChatResult
+
+
+StreamEvent = TextDelta | StreamDone
 
 
 class LLMError(Exception):
@@ -112,5 +131,18 @@ class LLMProvider(Protocol):
         response_schema: ResponseSchema | None = None,
         max_output_tokens: int = 4096,
     ) -> ChatResult: ...
+
+    def stream(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        model: str | None = None,
+        max_output_tokens: int = 4096,
+    ) -> AsyncIterator[StreamEvent]:
+        """Yield TextDelta events as text arrives, then exactly one StreamDone.
+
+        Closing the iterator early (user pressed Stop) closes the connection to the provider.
+        """
+        ...
 
     async def aclose(self) -> None: ...

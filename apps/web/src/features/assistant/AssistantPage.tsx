@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type UIEvent } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import { chatApi } from '../../api/chat'
 import { ApiError } from '../../api/http'
-import type { StoredMessage } from '../../api/types'
+import type { ConversationSummary, StoredMessage } from '../../api/types'
 import { Icon } from '../../components/ui/Icon'
 import { PageState } from '../../components/ui/PageState'
 import { useApi } from '../../lib/useApi'
@@ -57,14 +57,38 @@ interface Failure {
   message: string
 }
 
+/** A reply being streamed: the user's message and the text received so far. */
+interface LiveTurn {
+  userText: string
+  text: string
+}
+
+function localMessage(role: StoredMessage['role'], content: string, finishReason: string | null): StoredMessage {
+  return {
+    id: crypto.randomUUID(),
+    role,
+    content,
+    created_at: new Date().toISOString(),
+    model: null,
+    input_tokens: null,
+    output_tokens: null,
+    cost_usd: null,
+    latency_ms: null,
+    finish_reason: finishReason,
+  }
+}
+
 function Chat({ conversationId, initialMessages }: { conversationId: string | null; initialMessages: StoredMessage[] }) {
   const [messages, setMessages] = useState(initialMessages)
-  const [pending, setPending] = useState<string | null>(null)
+  const [live, setLive] = useState<LiveTurn | null>(null)
   const [failure, setFailure] = useState<Failure | null>(null)
   const [showDetails, setShowDetails] = useState(() => window.matchMedia('(min-width: 1200px)').matches)
   const { upsert } = useConversations()
   const navigate = useNavigate()
   const endRef = useRef<HTMLDivElement>(null)
+  const abortRef = useRef<AbortController | null>(null)
+  // Follow new text only while the user is at the bottom; scrolling up to read stops it.
+  const followRef = useRef(true)
 
   // False once the user has moved to another chat: a late reply must not navigate them back.
   const alive = useRef(true)
@@ -72,43 +96,90 @@ function Chat({ conversationId, initialMessages }: { conversationId: string | nu
     alive.current = true
     return () => {
       alive.current = false
+      // Leaving the chat stops its reply; the server keeps the part already received.
+      abortRef.current?.abort()
     }
   }, [])
 
-  // Keep the newest message in view, as chat apps do.
   useEffect(() => {
-    endRef.current?.scrollIntoView({ block: 'end' })
-  }, [messages.length, pending, failure])
+    if (followRef.current) endRef.current?.scrollIntoView({ block: 'end' })
+  }, [messages.length, live, failure])
 
-  async function send(text: string) {
-    setPending(text)
-    setFailure(null)
-    try {
-      const response = await chatApi.send({
-        message: text,
-        ...(conversationId ? { conversation_id: conversationId } : {}),
-      })
-      upsert(response.conversation)
-      if (!alive.current) return
-      const next = [...messages, response.user_message, response.assistant_message]
-      if (conversationId === null) {
-        navigate(`/assistant/${response.conversation.id}`, { state: { messages: next } })
-      } else {
-        setMessages(next)
-      }
-    } catch (error) {
-      if (!alive.current) return
-      setFailure({
-        text,
-        message: error instanceof ApiError ? error.message : 'Could not reach LifePilot. Check your connection.',
-      })
-    } finally {
-      if (alive.current) setPending(null)
+  function handleScroll(event: UIEvent<HTMLDivElement>) {
+    const el = event.currentTarget
+    followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+  }
+
+  /** Show a finished turn: append it, or move a brand-new chat to its own URL. */
+  function finish(conversation: ConversationSummary, turn: StoredMessage[]) {
+    upsert(conversation)
+    if (!alive.current) return
+    const next = [...messages, ...turn]
+    if (conversationId === null) {
+      navigate(`/assistant/${conversation.id}`, { state: { messages: next } })
+    } else {
+      setMessages(next)
     }
   }
 
+  async function send(text: string) {
+    const controller = new AbortController()
+    abortRef.current = controller
+    followRef.current = true
+    setLive({ userText: text, text: '' })
+    setFailure(null)
+    let started: { conversation_id: string; title: string } | null = null
+    let received = ''
+    try {
+      const request = { message: text, ...(conversationId ? { conversation_id: conversationId } : {}) }
+      for await (const event of chatApi.stream(request, controller.signal)) {
+        if (event.type === 'start') {
+          started = event
+        } else if (event.type === 'delta') {
+          received += event.text
+          setLive({ userText: text, text: received })
+        } else if (event.type === 'done') {
+          finish(event.conversation, [event.user_message, event.assistant_message])
+          return
+        } else {
+          if (alive.current) setFailure({ text, message: event.message })
+          return
+        }
+      }
+      if (alive.current) setFailure({ text, message: 'The connection was lost before the reply finished.' })
+    } catch (error) {
+      if (controller.signal.aborted) {
+        // Stopped. The server saves what was received; show the same thing here.
+        const partial = received.trim()
+        if (started && partial) {
+          const now = new Date().toISOString()
+          finish({ id: started.conversation_id, title: started.title, created_at: now, updated_at: now }, [
+            localMessage('user', text, null),
+            localMessage('assistant', partial, 'cancelled'),
+          ])
+        } else if (alive.current) {
+          setFailure({ text, message: 'Stopped before LifePilot replied.' })
+        }
+        return
+      }
+      if (alive.current) {
+        setFailure({
+          text,
+          message: error instanceof ApiError ? error.message : 'Could not reach LifePilot. Check your connection.',
+        })
+      }
+    } finally {
+      abortRef.current = null
+      if (alive.current) setLive(null)
+    }
+  }
+
+  function stop() {
+    abortRef.current?.abort()
+  }
+
   const lastReply = messages.findLast((m) => m.role === 'assistant') ?? null
-  const isEmpty = messages.length === 0 && pending === null && failure === null
+  const isEmpty = messages.length === 0 && live === null && failure === null
 
   return (
     <div className="flex h-full">
@@ -130,7 +201,7 @@ function Chat({ conversationId, initialMessages }: { conversationId: string | nu
           <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-6 px-5 pb-16">
             <h2 className="m-0 text-center text-2xl font-semibold sm:text-3xl">What can I help with?</h2>
             <div className="w-full max-w-3xl">
-              <Composer onSend={send} disabled={false} autoFocus />
+              <Composer onSend={send} onStop={stop} busy={false} autoFocus />
             </div>
             <ul aria-label="Suggestions" className="m-0 flex list-none flex-wrap justify-center gap-2 p-0">
               {SUGGESTIONS.map((suggestion) => (
@@ -148,21 +219,19 @@ function Chat({ conversationId, initialMessages }: { conversationId: string | nu
           </div>
         ) : (
           <>
-            <div className="min-h-0 flex-1 overflow-y-auto">
+            <div className="min-h-0 flex-1 overflow-y-auto" onScroll={handleScroll}>
               <ol aria-label="Messages" className="mx-auto my-0 flex max-w-3xl list-none flex-col gap-8 px-5 py-6">
                 {messages.map((message) => (
                   <li key={message.id} className="flex flex-col">
                     {message.role === 'user' ? <UserBubble text={message.content} /> : <AssistantReply message={message} />}
                   </li>
                 ))}
-                {pending !== null && (
+                {live !== null && (
                   <>
                     <li className="flex flex-col">
-                      <UserBubble text={pending} />
+                      <UserBubble text={live.userText} />
                     </li>
-                    <li className="flex flex-col">
-                      <Thinking />
-                    </li>
+                    <li className="flex flex-col">{live.text ? <StreamingReply text={live.text} /> : <Thinking />}</li>
                   </>
                 )}
                 {failure && (
@@ -193,7 +262,7 @@ function Chat({ conversationId, initialMessages }: { conversationId: string | nu
             </div>
 
             <div className="mx-auto w-full max-w-3xl flex-none px-5 pb-4">
-              <Composer onSend={send} disabled={pending !== null} />
+              <Composer onSend={send} onStop={stop} busy={live !== null} />
             </div>
           </>
         )}
@@ -226,9 +295,20 @@ function AssistantReply({ message }: { message: StoredMessage }) {
       {message.finish_reason === 'length' && (
         <p className="m-0 text-xs font-medium text-warning">This reply was cut off because it reached the length limit.</p>
       )}
+      {message.finish_reason === 'cancelled' && <p className="m-0 text-xs font-medium text-muted">Stopped</p>}
       <div className="-ml-1.5 flex">
         <CopyButton text={message.content} />
       </div>
+    </div>
+  )
+}
+
+function StreamingReply({ text }: { text: string }) {
+  // aria-busy: screen readers wait for the finished reply instead of announcing every word.
+  return (
+    <div aria-busy="true" className="flex flex-col gap-2.5">
+      <Markdown text={text} />
+      <span aria-hidden="true" className="inline-block h-4 w-2 animate-pulse rounded-sm bg-ink-soft" />
     </div>
   )
 }
@@ -278,15 +358,18 @@ function CopyButton({ text }: { text: string }) {
 
 function Composer({
   onSend,
-  disabled,
+  onStop,
+  busy,
   autoFocus = false,
 }: {
   onSend: (text: string) => void
-  disabled: boolean
+  onStop: () => void
+  /** A reply is streaming: the send button becomes a stop button. */
+  busy: boolean
   autoFocus?: boolean
 }) {
   const [text, setText] = useState('')
-  const canSend = text.trim().length > 0 && !disabled
+  const canSend = text.trim().length > 0 && !busy
 
   function submit() {
     if (!canSend) return
@@ -333,18 +416,37 @@ function Composer({
         onChange={(e) => setText(e.target.value)}
         onKeyDown={handleKeyDown}
         placeholder="Ask LifePilot anything…"
-        className="max-h-40 min-h-10 flex-1 resize-none border-none bg-transparent px-1 py-2.5 text-[15px] leading-5 text-ink outline-none [field-sizing:content]"
+        className="max-h-40 min-h-10 flex-1 resize-none border-none bg-transparent px-1 py-2.5 text-[15px] leading-5 text-ink outline-none field-sizing-content"
       />
-      <button
-        type="submit"
-        disabled={!canSend}
-        aria-label="Send message"
-        className="flex size-10 flex-none cursor-pointer items-center justify-center rounded-full border-none bg-accent text-on-accent hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-40"
-      >
-        <Icon name="send" strokeWidth={2.2} />
-      </button>
+      {busy ? (
+        <button
+          type="button"
+          onClick={onStop}
+          aria-label="Stop generating"
+          title="Stop"
+          className="flex size-10 flex-none cursor-pointer items-center justify-center rounded-full border-none bg-ink text-canvas hover:opacity-85"
+        >
+          <Icon name="stop" size={16} strokeWidth={2.5} />
+        </button>
+      ) : (
+        <button
+          type="submit"
+          disabled={!canSend}
+          aria-label="Send message"
+          className="flex size-10 flex-none cursor-pointer items-center justify-center rounded-full border-none bg-accent text-on-accent hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          <Icon name="send" strokeWidth={2.2} />
+        </button>
+      )}
     </form>
   )
+}
+
+const FINISH_LABEL: Record<string, string> = {
+  stop: 'complete',
+  length: 'cut off (length limit)',
+  cancelled: 'stopped by you',
+  content_filter: 'blocked by content filter',
 }
 
 /** "0.00010800" → "$0.000108". Display only: string formatting, no float arithmetic on money. */
@@ -362,7 +464,7 @@ function DetailsPanel({ reply, onClose }: { reply: StoredMessage | null; onClose
         ['Tokens out', String(reply.output_tokens ?? '—')],
         ['Cost', formatUsd(reply.cost_usd)],
         ['Time', reply.latency_ms === null ? '—' : `${(reply.latency_ms / 1000).toFixed(1)} s`],
-        ['Finished', reply.finish_reason === 'stop' ? 'complete' : (reply.finish_reason ?? '—')],
+        ['Finished', FINISH_LABEL[reply.finish_reason ?? ''] ?? reply.finish_reason ?? '—'],
       ]
     : []
 
@@ -409,8 +511,8 @@ function DetailsPanel({ reply, onClose }: { reply: StoredMessage | null; onClose
         </span>
       </div>
       <p className="m-0 text-xs leading-normal text-muted">
-        Coming next: replies that stream in word by word, then tools that read and save your records, each result
-        checked against the database before LifePilot confirms it.
+        Coming next: tools that read and save your records, each result checked against the database before
+        LifePilot confirms it.
       </p>
     </aside>
   )

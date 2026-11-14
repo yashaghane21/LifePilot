@@ -32,10 +32,11 @@ class AssistantReply:
     content: str
     model: str
     prompt_version: str
-    input_tokens: int
-    output_tokens: int
+    # None when unknown, e.g. a reply the user stopped before the provider reported usage.
+    input_tokens: int | None
+    output_tokens: int | None
     cost_usd: Decimal | None
-    latency_ms: int
+    latency_ms: int | None
     finish_reason: str
 
 
@@ -86,13 +87,18 @@ async def record_turn(
     conversation_id: uuid.UUID | None,
     user_text: str,
     reply: AssistantReply,
+    *,
+    new_conversation_id: uuid.UUID | None = None,
 ) -> tuple[Conversation, Message, Message]:
     """Store one user message and its reply atomically: both are saved, or neither is.
 
-    With `conversation_id=None` a new conversation is started and titled from `user_text`.
+    With `conversation_id=None` a new conversation is started and titled from `user_text`, using
+    `new_conversation_id` if given (streaming announces the id before anything is stored).
     """
     if conversation_id is None:
-        conversation = Conversation(user_id=user_id, title=title_from_message(user_text))
+        conversation = Conversation(
+            id=new_conversation_id or uuid.uuid7(), user_id=user_id, title=title_from_message(user_text)
+        )
         db.add(conversation)
         await db.flush()
     else:

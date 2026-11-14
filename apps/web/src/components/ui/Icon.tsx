@@ -26,6 +26,7 @@ export type IconName =
   | 'logout'
   | 'trash'
   | 'retry'
+  | 'stop'
 
 const PATHS: Record<IconName, ReactNode> = {
   trash: (
@@ -36,6 +37,7 @@ const PATHS: Record<IconName, ReactNode> = {
       <path d="M9 7V4h6v3" />
     </>
   ),
+  stop: <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" />,
   retry: (
     <>
       <path d="M4 12a8 8 0 1 0 2.3-5.6" />

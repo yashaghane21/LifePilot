@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import APIRouter, FastAPI
 
 from app.ai.chat.router import router as chat_router
+from app.ai.chat.service import drain_background_saves
 from app.ai.providers.factory import close_llm_provider
 from app.core.config import get_settings
 from app.core.errors import register_exception_handlers
@@ -20,7 +21,8 @@ from app.modules.users.router import router as users_router
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
-    # Close pooled connections cleanly on shutdown.
+    # Let saves of stopped replies finish, then close pooled connections cleanly.
+    await drain_background_saves()
     await close_llm_provider()
     await engine.dispose()
 

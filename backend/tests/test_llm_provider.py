@@ -14,6 +14,7 @@ from app.ai.providers.base import (
     LLMRateLimitError,
     LLMUnavailableError,
     ResponseSchema,
+    TextDelta,
     ToolCall,
     ToolSpec,
 )
@@ -258,3 +259,105 @@ class TestFakeProvider:
         assert first.finish_reason == "tool_calls"
         assert second.content == "(fake reply) Hi"
         assert len(fake.calls) == 2
+
+
+def sse_body(*chunks: dict[str, Any] | str, done: bool = True) -> bytes:
+    """An OpenAI-style event stream. A str chunk is sent as a raw line (e.g. a ':' comment)."""
+    lines = [chunk if isinstance(chunk, str) else f"data: {json.dumps(chunk)}" for chunk in chunks]
+    if done:
+        lines.append("data: [DONE]")
+    return ("\n\n".join(lines) + "\n\n").encode()
+
+
+def delta(text: str, **extra: Any) -> dict[str, Any]:
+    return {"choices": [{"delta": {"content": text, **extra}, "finish_reason": None}]}
+
+
+def streaming(*chunks: dict[str, Any] | str, done: bool = True) -> httpx.Response:
+    return httpx.Response(200, content=sse_body(*chunks, done=done), headers={"content-type": "text/event-stream"})
+
+
+async def collect(provider: OpenRouterProvider) -> tuple[list[str], Any]:
+    texts: list[str] = []
+    final = None
+    async for event in provider.stream(MESSAGES):
+        if isinstance(event, TextDelta):
+            texts.append(event.text)
+        else:
+            final = event.result
+    return texts, final
+
+
+class TestStream:
+    async def test_yields_text_as_it_arrives_then_the_full_result(self) -> None:
+        server = Scripted(
+            streaming(
+                ": OPENROUTER PROCESSING",  # keep-alive comment while the model thinks
+                {"id": "gen-7", "model": "anthropic/claude-opus-5.5", "choices": [{"delta": {"role": "assistant", "content": ""}}]},
+                delta("Hel"),
+                delta("lo", reasoning="hidden thoughts"),
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                {"choices": [], "usage": {"prompt_tokens": 9, "completion_tokens": 2, "cost": 0.00004}},
+            )
+        )
+
+        texts, result = await collect(make_provider(server))
+
+        assert texts == ["Hel", "lo"]
+        assert result.content == "Hello"
+        assert "hidden" not in result.content  # reasoning tokens are never forwarded
+        assert (result.usage.input_tokens, result.usage.output_tokens) == (9, 2)
+        assert result.usage.cost_usd == pytest.approx(0.00004)
+        assert result.finish_reason == "stop"
+        assert result.provider_request_id == "gen-7"
+        assert result.time_to_first_token_ms is not None
+        body = server.body()
+        assert body["stream"] is True and "temperature" not in body
+
+    async def test_retries_before_the_first_token(self) -> None:
+        server = Scripted(httpx.Response(503, json={"error": {"message": "busy"}}), streaming(delta("Hi")))
+
+        texts, result = await collect(make_provider(server, []))
+
+        assert texts == ["Hi"] and result.attempts == 2
+
+    async def test_does_not_retry_after_text_was_shown(self) -> None:
+        server = Scripted(
+            streaming(delta("Half a "), {"error": {"code": 502, "message": "upstream died"}}, done=False),
+            streaming(delta("never sent")),
+        )
+        texts: list[str] = []
+
+        with pytest.raises(LLMUnavailableError):
+            async for event in make_provider(server, []).stream(MESSAGES):
+                if isinstance(event, TextDelta):
+                    texts.append(event.text)
+
+        assert texts == ["Half a "]
+        assert len(server.requests) == 1  # a retry would glue a different reply onto this one
+
+    async def test_auth_error_fails_fast(self) -> None:
+        server = Scripted(httpx.Response(401, json={"error": {"message": "bad key"}}))
+
+        with pytest.raises(LLMAuthError):
+            await collect(make_provider(server))
+
+        assert len(server.requests) == 1
+
+    async def test_logs_time_to_first_token_but_not_content(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level("INFO")
+        server = Scripted(streaming(delta("Your PIN is 4821")))
+
+        await collect(make_provider(server))
+
+        [record] = [r for r in caplog.records if r.getMessage() == "llm_call"]
+        assert record.__dict__["ttft_ms"] is not None
+        assert "4821" not in str(record.__dict__)
+
+    async def test_fake_provider_streams_word_by_word(self) -> None:
+        fake = FakeProvider()
+        fake.reply("one two three")
+
+        texts = [e.text async for e in fake.stream(MESSAGES) if isinstance(e, TextDelta)]
+
+        assert texts == ["one ", "two ", "three"]

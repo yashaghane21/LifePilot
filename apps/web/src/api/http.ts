@@ -93,6 +93,17 @@ export function refreshAccessToken(): Promise<string | null> {
 }
 
 export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const response = await authorizedFetch(path, init)
+  if (response.status === 204) return undefined as T
+  return (await response.json()) as T
+}
+
+/** For streaming endpoints: the same auth and error handling, but the body is left unread. */
+export function apiStream(path: string, init: RequestInit = {}): Promise<Response> {
+  return authorizedFetch(path, init)
+}
+
+async function authorizedFetch(path: string, init: RequestInit): Promise<Response> {
   const send = (token: string | null) =>
     fetch(`${API_BASE}${path}`, {
       ...init,
@@ -118,6 +129,5 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
   }
 
   if (!response.ok) throw await toApiError(response)
-  if (response.status === 204) return undefined as T
-  return (await response.json()) as T
+  return response
 }

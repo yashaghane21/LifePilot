@@ -87,5 +87,5 @@ if `TEST_DATABASE_URL` is missing or points at the main database.
 - Phase 1 – Foundation: complete
 - Phase 2 – Authentication: complete, including web sessions (2b) and Sign in with Google (2c);
   login rate limiting pending
-- Phase 3 – AI assistant: LLM provider layer (3.1) and stored conversations with `POST /chat` (3.2)
-  done; streaming, structured outputs and tool calling next
+- Phase 3 – AI assistant: LLM provider layer (3.1), stored conversations with `POST /chat` (3.2)
+  and streaming replies with Stop (3.3) done; structured outputs and tool calling next
