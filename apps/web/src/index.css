@@ -1,0 +1,106 @@
+@import "tailwindcss";
+
+/* Colours are CSS variables so the theme can switch at runtime.
+   <html data-theme="light|dark"> picks the palette below; the accent trio
+   (--lp-accent, --lp-accent-hover, --lp-on-accent) is set from Settings by theme.ts.
+   Components only use the Tailwind names in @theme (bg-surface, text-muted, bg-accent...). */
+
+:root {
+  color-scheme: light;
+  --lp-canvas: #ffffff;
+  --lp-surface: #ffffff;
+  --lp-bubble: #f1f3f2;
+  --lp-ink: #0f1115;
+  --lp-ink-soft: #374151;
+  --lp-muted: #5f6672;
+  --lp-line: #e4e7eb;
+  --lp-line-soft: #f0f2f4;
+
+  --lp-sidebar: #f7f8f8;
+  --lp-sidebar-active: #e8ebea;
+  --lp-sidebar-text: #1f2328;
+  --lp-sidebar-muted: #6b7280;
+
+  --lp-accent: #15803d;
+  --lp-accent-hover: #166534;
+  --lp-on-accent: #ffffff;
+
+  --lp-success: #166534;
+  --lp-success-soft: #e9f6ec;
+  --lp-warning: #9a3412;
+  --lp-warning-strong: #c2410c;
+  --lp-warning-soft: #fff1e6;
+  --lp-warning-line: #f3c9a8;
+  --lp-danger: #b42318;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --lp-canvas: #0a0a0a;
+  --lp-surface: #141414;
+  --lp-bubble: #262626;
+  --lp-ink: #ececec;
+  --lp-ink-soft: #c9c9c9;
+  --lp-muted: #9b9b9b;
+  --lp-line: #2a2a2a;
+  --lp-line-soft: #1e1e1e;
+
+  --lp-sidebar: #000000;
+  --lp-sidebar-active: #1f1f1f;
+  --lp-sidebar-text: #e5e5e5;
+  --lp-sidebar-muted: #8c8c8c;
+
+  --lp-accent: #22c55e;
+  --lp-accent-hover: #4ade80;
+  --lp-on-accent: #052e16;
+
+  --lp-success: #4ade80;
+  --lp-success-soft: #0f2a19;
+  --lp-warning: #fdba74;
+  --lp-warning-strong: #f97316;
+  --lp-warning-soft: #2b1709;
+  --lp-warning-line: #5c3313;
+  --lp-danger: #dc2626;
+}
+
+@theme inline {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+
+  --color-canvas: var(--lp-canvas);
+  --color-surface: var(--lp-surface);
+  --color-bubble: var(--lp-bubble);
+  --color-ink: var(--lp-ink);
+  --color-ink-soft: var(--lp-ink-soft);
+  --color-muted: var(--lp-muted);
+  --color-line: var(--lp-line);
+  --color-line-soft: var(--lp-line-soft);
+
+  --color-sidebar: var(--lp-sidebar);
+  --color-sidebar-active: var(--lp-sidebar-active);
+  --color-sidebar-text: var(--lp-sidebar-text);
+  --color-sidebar-muted: var(--lp-sidebar-muted);
+
+  --color-accent: var(--lp-accent);
+  --color-accent-hover: var(--lp-accent-hover);
+  --color-on-accent: var(--lp-on-accent);
+  /* A faint tint of the accent for badges and highlights, in either theme. */
+  --color-accent-soft: color-mix(in oklab, var(--lp-accent) 16%, var(--lp-surface));
+
+  --color-success: var(--lp-success);
+  --color-success-soft: var(--lp-success-soft);
+  --color-warning: var(--lp-warning);
+  --color-warning-strong: var(--lp-warning-strong);
+  --color-warning-soft: var(--lp-warning-soft);
+  --color-warning-line: var(--lp-warning-line);
+  --color-danger: var(--lp-danger);
+}
+
+body {
+  margin: 0;
+  background: var(--lp-canvas);
+  color: var(--lp-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
